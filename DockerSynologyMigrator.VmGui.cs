@@ -503,8 +503,14 @@ internal sealed class VmMigrationForm : Form
     {
         split.Panel1MinSize = 150;
         split.Panel2MinSize = 140;
-        split.Resize += delegate
+        var initialized = false;
+        split.Layout += delegate
         {
+            if (initialized)
+            {
+                return;
+            }
+
             var available = split.Orientation == Orientation.Vertical ? split.ClientSize.Width : split.ClientSize.Height;
             if (available <= 0)
             {
@@ -518,10 +524,8 @@ internal sealed class VmMigrationForm : Form
                 return;
             }
 
-            if (split.SplitterDistance <= 0 || split.SplitterDistance > maxDistance)
-            {
-                split.SplitterDistance = Math.Max(split.Panel1MinSize, Math.Min(maxDistance, desired));
-            }
+            split.SplitterDistance = Math.Max(split.Panel1MinSize, Math.Min(maxDistance, desired));
+            initialized = true;
         };
     }
 

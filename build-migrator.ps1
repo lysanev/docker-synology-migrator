@@ -1,26 +1,71 @@
 param(
-    [string[]]$SourceFiles = @(
-        "D:\codex\DockerSynologyMigrator.cs",
-        "D:\codex\DockerSynologyMigrator.Gui.cs",
-        "D:\codex\DockerSynologyMigrator.VmGui.cs"
-    ),
-    [string]$OutputDir = "D:\codex\dist",
-    [string]$IconPath = "D:\codex\assets\DockerSynologyMigrator.ico"
+    [string[]]$SourceFiles,
+    [string]$OutputDir,
+    [string]$IconPath
 )
 
 $ErrorActionPreference = "Stop"
 
+$ProjectRoot = Split-Path -Parent $PSCommandPath
+$WorkspaceRoot = Split-Path -Parent $ProjectRoot
+
+function Resolve-FirstExistingPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Candidates,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    foreach ($candidate in $Candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) {
+            return $candidate
+        }
+    }
+
+    throw "$Description not found. Checked: $($Candidates -join ', ')"
+}
+
+if (-not $SourceFiles -or $SourceFiles.Count -eq 0) {
+    $SourceFiles = @(
+        (Join-Path $ProjectRoot "DockerSynologyMigrator.cs"),
+        (Join-Path $ProjectRoot "DockerSynologyMigrator.Gui.cs"),
+        (Join-Path $ProjectRoot "DockerSynologyMigrator.VmGui.cs")
+    )
+}
+
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    $OutputDir = Join-Path $ProjectRoot "dist"
+}
+
+if ([string]::IsNullOrWhiteSpace($IconPath)) {
+    $IconPath = Resolve-FirstExistingPath `
+        -Description "Application icon" `
+        -Candidates @(
+            (Join-Path $ProjectRoot "assets\DockerSynologyMigrator.ico"),
+            (Join-Path $WorkspaceRoot "assets\DockerSynologyMigrator.ico")
+        )
+}
+
 $compiler = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
-$sshNet = "D:\codex\vendor\sshnet_pkg\lib\net462\Renci.SshNet.dll"
-$bouncyCastle = "D:\codex\vendor\deps\BouncyCastle.Cryptography.2.4.0\lib\net461\BouncyCastle.Cryptography.dll"
-$asyncInterfaces = "D:\codex\vendor\deps\Microsoft.Bcl.AsyncInterfaces.1.0.0\lib\net461\Microsoft.Bcl.AsyncInterfaces.dll"
-$asn1 = "D:\codex\vendor\deps\System.Formats.Asn1.8.0.1\lib\net462\System.Formats.Asn1.dll"
-$tasksExtensions = "D:\codex\vendor\deps\System.Threading.Tasks.Extensions.4.5.2\lib\netstandard2.0\System.Threading.Tasks.Extensions.dll"
-$buffers = "D:\codex\vendor\deps\System.Buffers.4.5.1\lib\net461\System.Buffers.dll"
-$memory = "D:\codex\vendor\deps\System.Memory.4.5.5\lib\net461\System.Memory.dll"
-$valueTuple = "D:\codex\vendor\deps\System.ValueTuple.4.5.0\lib\net461\System.ValueTuple.dll"
-$unsafe = "D:\codex\vendor\deps\System.Runtime.CompilerServices.Unsafe.4.5.3\lib\net461\System.Runtime.CompilerServices.Unsafe.dll"
-$vectors = "D:\codex\vendor\deps\System.Numerics.Vectors.4.5.0\lib\net46\System.Numerics.Vectors.dll"
+$VendorRoot = Resolve-FirstExistingPath `
+    -Description "Vendor dependency folder" `
+    -Candidates @(
+        (Join-Path $ProjectRoot "vendor"),
+        (Join-Path $WorkspaceRoot "vendor"),
+        "D:\codex\vendor"
+    )
+
+$sshNet = Join-Path $VendorRoot "sshnet_pkg\lib\net462\Renci.SshNet.dll"
+$bouncyCastle = Join-Path $VendorRoot "deps\BouncyCastle.Cryptography.2.4.0\lib\net461\BouncyCastle.Cryptography.dll"
+$asyncInterfaces = Join-Path $VendorRoot "deps\Microsoft.Bcl.AsyncInterfaces.1.0.0\lib\net461\Microsoft.Bcl.AsyncInterfaces.dll"
+$asn1 = Join-Path $VendorRoot "deps\System.Formats.Asn1.8.0.1\lib\net462\System.Formats.Asn1.dll"
+$tasksExtensions = Join-Path $VendorRoot "deps\System.Threading.Tasks.Extensions.4.5.2\lib\netstandard2.0\System.Threading.Tasks.Extensions.dll"
+$buffers = Join-Path $VendorRoot "deps\System.Buffers.4.5.1\lib\net461\System.Buffers.dll"
+$memory = Join-Path $VendorRoot "deps\System.Memory.4.5.5\lib\net461\System.Memory.dll"
+$valueTuple = Join-Path $VendorRoot "deps\System.ValueTuple.4.5.0\lib\net461\System.ValueTuple.dll"
+$unsafe = Join-Path $VendorRoot "deps\System.Runtime.CompilerServices.Unsafe.4.5.3\lib\net461\System.Runtime.CompilerServices.Unsafe.dll"
+$vectors = Join-Path $VendorRoot "deps\System.Numerics.Vectors.4.5.0\lib\net46\System.Numerics.Vectors.dll"
 $output = Join-Path $OutputDir "DockerSynologyMigrator.exe"
 
 if (-not (Test-Path $compiler)) {

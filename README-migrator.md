@@ -36,12 +36,12 @@ Windows GUI utility for migrating Docker containers and their data from Synology
 ## Build
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File D:\codex\build-migrator.ps1
+powershell -ExecutionPolicy Bypass -File .\build-migrator.ps1
 ```
 
 ## Run
 
-Run [DockerSynologyMigrator.exe](D:\codex\dist\DockerSynologyMigrator.exe) without arguments.
+Run `dist\DockerSynologyMigrator.exe` without arguments after building.
 
 ## GUI flow
 
