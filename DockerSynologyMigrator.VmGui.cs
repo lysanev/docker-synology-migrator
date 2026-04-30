@@ -404,12 +404,18 @@ internal sealed class VmMigrationForm : Form
 
     private Control BuildTargetVirtualMachinesPanel()
     {
-        var panel = new Panel();
-        panel.Dock = DockStyle.Fill;
+        var layout = new TableLayoutPanel();
+        layout.Dock = DockStyle.Fill;
+        layout.Margin = new Padding(0);
+        layout.Padding = new Padding(0);
+        layout.ColumnCount = 1;
+        layout.RowCount = 2;
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
 
         var buttons = new FlowLayoutPanel();
-        buttons.Dock = DockStyle.Top;
-        buttons.Height = 42;
+        buttons.Dock = DockStyle.Fill;
+        buttons.Margin = new Padding(0);
         buttons.Padding = new Padding(0, 0, 0, 4);
         buttons.FlowDirection = FlowDirection.LeftToRight;
         buttons.WrapContents = false;
@@ -448,15 +454,16 @@ internal sealed class VmMigrationForm : Form
         _targetDetailsTextBox.Text = "Load Proxmox inventory to manage imported virtual machines.";
 
         _targetVirtualMachineSplitContainer.Dock = DockStyle.Fill;
+        _targetVirtualMachineSplitContainer.Margin = new Padding(0);
         _targetVirtualMachineSplitContainer.Orientation = Orientation.Horizontal;
         _targetVirtualMachineSplitContainer.SplitterWidth = 6;
         ConfigureInitialSplitterDistance(_targetVirtualMachineSplitContainer, 0, 150);
         _targetVirtualMachineSplitContainer.Panel1.Controls.Add(_targetVirtualMachineListView);
         _targetVirtualMachineSplitContainer.Panel2.Controls.Add(_targetDetailsTextBox);
 
-        panel.Controls.Add(_targetVirtualMachineSplitContainer);
-        panel.Controls.Add(buttons);
-        return panel;
+        layout.Controls.Add(buttons, 0, 0);
+        layout.Controls.Add(_targetVirtualMachineSplitContainer, 0, 1);
+        return layout;
     }
 
     private Control BuildLogPanel()

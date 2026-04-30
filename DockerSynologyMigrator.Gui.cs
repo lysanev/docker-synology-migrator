@@ -14,7 +14,7 @@ using System.Web.Script.Serialization;
 
 internal static class Program
 {
-    internal const string AppVersion = "2026.04.28.1";
+    internal const string AppVersion = "2026.04.30.1";
 
     [STAThread]
     private static void Main(string[] args)
