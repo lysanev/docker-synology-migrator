@@ -3314,10 +3314,14 @@ internal static class MigratorCore
                 throw new InvalidOperationException("Source VM disk path does not exist: " + disk.SourcePath);
             }
 
-            Log("Exporting VM disk {0}:{1}", vm.Name, disk.TargetName);
-            var localTempPath = DownloadCommandOutputToTempFile(sourceClient, source, "cat " + ShellQuote(disk.SourcePath), BuildVirtualMachineDiskFileName(vm, disk, index));
+            var diskLabel = BuildVirtualMachineDiskProgressLabel(vm, disk, index);
+            var transferBytes = GetVirtualMachineDiskTransferBytes(disk);
+            Log("Exporting VM disk {0}", diskLabel);
+            var exportProgress = CreateVmTransferProgressReporter("Exporting VM disk " + diskLabel, transferBytes);
+            var localTempPath = DownloadCommandOutputToTempFile(sourceClient, source, "cat " + ShellQuote(disk.SourcePath), BuildVirtualMachineDiskFileName(vm, disk, index), exportProgress);
             try
             {
+                ReportTransferProgress(exportProgress, transferBytes);
                 if (!string.IsNullOrWhiteSpace(stagingRoot))
                 {
                     ImportVirtualMachineDiskFromStorageStaging(targetClient, target, targetSftp, localTempPath, stagingRoot, vm, disk, index, targetStorage);
@@ -3338,14 +3342,18 @@ internal static class MigratorCore
     {
         var remoteFileName = BuildVirtualMachineDiskFileName(vm, disk, index);
         var remotePath = stagingRoot.TrimEnd('/') + "/vm-import/" + remoteFileName;
-        Log("Uploading VM disk {0} to Proxmox staging on storage {1}...", disk.TargetName, targetStorage);
-        UploadLocalFile(targetSftp, localTempPath, remotePath);
+        var diskLabel = BuildVirtualMachineDiskProgressLabel(vm, disk, index);
+        Log("Importing VM disk {0} to Proxmox staging on storage {1}...", diskLabel, targetStorage);
+        var importProgress = CreateVmTransferProgressReporter("Importing VM disk " + diskLabel, new FileInfo(localTempPath).Length);
+        UploadLocalFile(targetSftp, localTempPath, remotePath, importProgress);
+        ReportTransferProgress(importProgress, new FileInfo(localTempPath).Length);
 
         var vmId = vm.AssignedTargetVmId ?? 0;
-        Log("Importing VM disk {0} into Proxmox storage {1}...", disk.TargetName, targetStorage);
+        Log("Finalizing VM disk {0} into Proxmox storage {1}...", diskLabel, targetStorage);
         ExecuteCommand(targetClient,
             "qm importdisk " + vmId.ToString(CultureInfo.InvariantCulture) + " " + ShellQuote(remotePath) + " " + ShellQuote(targetStorage),
             target);
+        Log("VM disk import finalized: {0}", diskLabel);
 
         var unusedReference = GetLatestUnusedDiskReference(targetClient, target, vmId);
         ExecuteCommand(targetClient,
@@ -3391,8 +3399,11 @@ internal static class MigratorCore
                 ". Use a file-based Proxmox storage for VM staging/import, or select a local block storage whose 'pvesm path' returns /dev/...");
         }
 
-        Log("Uploading raw VM disk {0} directly to Proxmox volume {1}...", disk.TargetName, diskReference);
-        UploadLocalFile(targetSftp, localTempPath, diskPath);
+        var diskLabel = BuildVirtualMachineDiskProgressLabel(vm, disk, index);
+        Log("Importing VM disk {0} directly to Proxmox volume {1}...", diskLabel, diskReference);
+        var importProgress = CreateVmTransferProgressReporter("Importing VM disk " + diskLabel, new FileInfo(localTempPath).Length);
+        UploadLocalFile(targetSftp, localTempPath, diskPath, importProgress);
+        ReportTransferProgress(importProgress, new FileInfo(localTempPath).Length);
         SetVirtualMachineBootDiskIfNeeded(targetClient, target, vmId, index);
     }
 
@@ -3418,6 +3429,74 @@ internal static class MigratorCore
         }
 
         return match.Groups[1].Value.Trim();
+    }
+
+    private static string BuildVirtualMachineDiskProgressLabel(VirtualMachineDefinition vm, VirtualMachineDiskDefinition disk, int index)
+    {
+        var vmName = NormalizeOptionalValue(vm == null ? null : vm.Name) ?? "unknown-vm";
+        var diskName = NormalizeOptionalValue(disk == null ? null : disk.TargetName) ??
+                       ("disk" + index.ToString(CultureInfo.InvariantCulture));
+        return vmName + ":" + diskName;
+    }
+
+    private static long GetVirtualMachineDiskTransferBytes(VirtualMachineDiskDefinition disk)
+    {
+        if (disk == null)
+        {
+            return 0;
+        }
+
+        return Math.Max(0L, Math.Max(disk.ActualSizeBytes, disk.VirtualSizeBytes));
+    }
+
+    private static Action<long> CreateVmTransferProgressReporter(string operationLabel, long totalBytes)
+    {
+        var normalizedLabel = NormalizeOptionalValue(operationLabel) ?? "VM disk transfer";
+        var normalizedTotal = Math.Max(0L, totalBytes);
+        var lastPercent = -1;
+        var lastLogUtc = DateTime.MinValue;
+
+        return delegate(long transferredBytes)
+        {
+            if (normalizedTotal <= 0)
+            {
+                return;
+            }
+
+            var transferred = Math.Max(0L, Math.Min(normalizedTotal, transferredBytes));
+            var percent = Math.Max(0, Math.Min(100, (int)Math.Floor((double)transferred * 100D / normalizedTotal)));
+            var now = DateTime.UtcNow;
+            if (percent < 100 &&
+                percent <= lastPercent &&
+                (now - lastLogUtc).TotalSeconds < 5)
+            {
+                return;
+            }
+
+            if (percent < 100 &&
+                lastPercent >= 0 &&
+                percent < lastPercent + 1 &&
+                (now - lastLogUtc).TotalSeconds < 5)
+            {
+                return;
+            }
+
+            lastPercent = percent;
+            lastLogUtc = now;
+            Log("VM transfer progress: {0} {1} ({2} / {3})",
+                normalizedLabel,
+                FormatTransferPercent(percent),
+                FormatBytes(transferred),
+                FormatBytes(normalizedTotal));
+        };
+    }
+
+    private static void ReportTransferProgress(Action<long> progress, long transferredBytes)
+    {
+        if (progress != null)
+        {
+            progress(Math.Max(0L, transferredBytes));
+        }
     }
 
     private static string GetLatestUnusedDiskReference(SshClient targetClient, ConnectionInfoData target, int vmId)
@@ -6485,6 +6564,11 @@ internal static class MigratorCore
         return value.ToString(value >= 10 || unitIndex == 0 ? "0" : "0.00", CultureInfo.InvariantCulture) + " " + units[unitIndex];
     }
 
+    private static string FormatTransferPercent(int percent)
+    {
+        return Math.Max(0, Math.Min(100, percent)).ToString(CultureInfo.InvariantCulture) + "%";
+    }
+
     private static bool ImageExistsOnTarget(SshClient targetClient, ConnectionInfoData targetInfo, string imageName)
     {
         string output;
@@ -6507,10 +6591,15 @@ internal static class MigratorCore
 
     private static string DownloadCommandOutputToTempFile(SshClient client, ConnectionInfoData connectionInfo, string commandText, string preferredFileName)
     {
+        return DownloadCommandOutputToTempFile(client, connectionInfo, commandText, preferredFileName, null);
+    }
+
+    private static string DownloadCommandOutputToTempFile(SshClient client, ConnectionInfoData connectionInfo, string commandText, string preferredFileName, Action<long> progress)
+    {
         var tempPath = CreateLocalTransferTempFilePath(preferredFileName);
         try
         {
-            DownloadCommandOutputToFile(client, connectionInfo, commandText, tempPath, false);
+            DownloadCommandOutputToFile(client, connectionInfo, commandText, tempPath, false, progress);
             return tempPath;
         }
         catch
@@ -6522,6 +6611,11 @@ internal static class MigratorCore
 
     private static void DownloadCommandOutputToFile(SshClient client, ConnectionInfoData connectionInfo, string commandText, string localPath, bool useSudo)
     {
+        DownloadCommandOutputToFile(client, connectionInfo, commandText, localPath, useSudo, null);
+    }
+
+    private static void DownloadCommandOutputToFile(SshClient client, ConnectionInfoData connectionInfo, string commandText, string localPath, bool useSudo, Action<long> progress)
+    {
         var shouldRetryWithSudo = false;
         string failureDetails = null;
 
@@ -6529,7 +6623,7 @@ internal static class MigratorCore
         using (var cmd = client.CreateCommand(PrepareRemoteCommand(commandText, connectionInfo, useSudo)))
         {
             var async = cmd.BeginExecute();
-            cmd.OutputStream.CopyTo(fileStream, 1024 * 128);
+            CopyStreamWithProgress(cmd.OutputStream, fileStream, progress);
             cmd.EndExecute(async);
             fileStream.Flush();
 
@@ -6544,7 +6638,7 @@ internal static class MigratorCore
 
         if (shouldRetryWithSudo)
         {
-            DownloadCommandOutputToFile(client, connectionInfo, commandText, localPath, true);
+            DownloadCommandOutputToFile(client, connectionInfo, commandText, localPath, true, progress);
             return;
         }
 
@@ -6588,9 +6682,33 @@ internal static class MigratorCore
 
     private static void UploadLocalFile(SftpClient targetSftp, string localPath, string remotePath)
     {
+        UploadLocalFile(targetSftp, localPath, remotePath, null);
+    }
+
+    private static void UploadLocalFile(SftpClient targetSftp, string localPath, string remotePath, Action<long> progress)
+    {
         using (var fileStream = new FileStream(localPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 128, FileOptions.SequentialScan))
         {
-            targetSftp.UploadFile(fileStream, remotePath, true);
+            if (progress == null)
+            {
+                targetSftp.UploadFile(fileStream, remotePath, true);
+                return;
+            }
+
+            targetSftp.UploadFile(fileStream, remotePath, true, uploaded => progress(uploaded > (ulong)long.MaxValue ? long.MaxValue : (long)uploaded));
+        }
+    }
+
+    private static void CopyStreamWithProgress(Stream input, Stream output, Action<long> progress)
+    {
+        var buffer = new byte[1024 * 128];
+        long totalRead = 0;
+        int read;
+        while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+        {
+            output.Write(buffer, 0, read);
+            totalRead = AddBytes(totalRead, read);
+            ReportTransferProgress(progress, totalRead);
         }
     }
 

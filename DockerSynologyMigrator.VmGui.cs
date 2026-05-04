@@ -44,6 +44,7 @@ internal sealed class VmMigrationForm : Form
     private readonly RichTextBox _logTextBox = new RichTextBox();
     private readonly Label _selectionLabel = new Label();
     private readonly Label _statusLabel = new Label();
+    private readonly ProgressBar _progressBar = new ProgressBar();
     private readonly Label _logPathLabel = new Label();
     private readonly SplitContainer _workspaceSplitContainer = new SplitContainer();
     private readonly SplitContainer _mainSplitContainer = new SplitContainer();
@@ -312,8 +313,9 @@ internal sealed class VmMigrationForm : Form
 
         var statusPanel = new TableLayoutPanel();
         statusPanel.Dock = DockStyle.Fill;
-        statusPanel.ColumnCount = 2;
-        statusPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 520F));
+        statusPanel.ColumnCount = 3;
+        statusPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 320F));
+        statusPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 260F));
         statusPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
 
         _selectionLabel.Dock = DockStyle.Fill;
@@ -324,8 +326,16 @@ internal sealed class VmMigrationForm : Form
         _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
         _statusLabel.AutoEllipsis = true;
 
+        _progressBar.Dock = DockStyle.Fill;
+        _progressBar.Margin = new Padding(8, 8, 8, 8);
+        _progressBar.Minimum = 0;
+        _progressBar.Maximum = 1000;
+        _progressBar.Value = 0;
+        _progressBar.Style = ProgressBarStyle.Blocks;
+
         statusPanel.Controls.Add(_selectionLabel, 0, 0);
-        statusPanel.Controls.Add(_statusLabel, 1, 0);
+        statusPanel.Controls.Add(_progressBar, 1, 0);
+        statusPanel.Controls.Add(_statusLabel, 2, 0);
 
         panel.Controls.Add(buttonsPanel, 0, 0);
         panel.Controls.Add(statusPanel, 0, 1);
@@ -1554,12 +1564,74 @@ internal sealed class VmMigrationForm : Form
     {
         _busy = busy;
         _statusLabel.Text = statusText;
+        if (busy)
+        {
+            _progressBar.Style = ProgressBarStyle.Marquee;
+            _progressBar.Value = 0;
+        }
+        else
+        {
+            _progressBar.Style = ProgressBarStyle.Blocks;
+            _progressBar.Value = 0;
+        }
         UpdateUiState();
     }
 
     private void HandleCoreLog(string message)
     {
         AppendLogLine(message);
+        UpdateVmTransferProgressFromCoreLog(message);
+    }
+
+    private void UpdateVmTransferProgressFromCoreLog(string message)
+    {
+        if (string.IsNullOrWhiteSpace(message) ||
+            message.IndexOf("VM transfer progress:", StringComparison.OrdinalIgnoreCase) < 0)
+        {
+            return;
+        }
+
+        double percent;
+        if (!TryParseProgressPercent(message, out percent))
+        {
+            return;
+        }
+
+        var value = Math.Max(0, Math.Min(_progressBar.Maximum, (int)Math.Round(percent * 10D)));
+        var status = message.StartsWith("[*] ", StringComparison.Ordinal) ? message.Substring(4) : message;
+        if (InvokeRequired)
+        {
+            BeginInvoke((MethodInvoker)delegate
+            {
+                _progressBar.Style = ProgressBarStyle.Continuous;
+                _progressBar.Value = value;
+                _statusLabel.Text = status;
+            });
+            return;
+        }
+
+        _progressBar.Style = ProgressBarStyle.Continuous;
+        _progressBar.Value = value;
+        _statusLabel.Text = status;
+    }
+
+    private static bool TryParseProgressPercent(string message, out double percent)
+    {
+        percent = 0D;
+        var percentIndex = string.IsNullOrWhiteSpace(message) ? -1 : message.IndexOf('%');
+        if (percentIndex <= 0)
+        {
+            return false;
+        }
+
+        var start = percentIndex - 1;
+        while (start >= 0 && (char.IsDigit(message[start]) || message[start] == '.'))
+        {
+            start--;
+        }
+
+        var token = message.Substring(start + 1, percentIndex - start - 1);
+        return double.TryParse(token, NumberStyles.Float, CultureInfo.InvariantCulture, out percent);
     }
 
     private void AppendLogLine(string message)
