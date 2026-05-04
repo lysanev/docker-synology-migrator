@@ -264,6 +264,7 @@ internal static class MigratorCore
 
             var plan = BuildVirtualMachineMigrationPlan(sourceClient, targetClient, options);
             LogVirtualMachinePlan(plan, options);
+            ValidateVirtualMachineTargetFreeSpace(targetClient, options.Target, plan, options.DryRun);
 
             if (options.DryRun)
             {
@@ -447,6 +448,7 @@ internal static class MigratorCore
             targetClient.Connect();
             var plan = BuildMigrationPlan(sourceClient, targetClient, options);
             LogPlan(plan, options);
+            ValidateContainerTargetFreeSpace(targetClient, options.Target, options.TargetRoot, plan, options.DryRun);
 
             if (options.DryRun)
             {
@@ -3068,6 +3070,99 @@ internal static class MigratorCore
                 var sizeBytes = disk.ActualSizeBytes > 0 ? disk.ActualSizeBytes : disk.VirtualSizeBytes;
                 Log("  disk {0}: {1}; format={2}; size={3}", disk.TargetName, source, disk.Format ?? "unknown", FormatBytes(sizeBytes));
             }
+        }
+    }
+
+    private static void ValidateContainerTargetFreeSpace(SshClient targetClient, ConnectionInfoData targetInfo, string targetRoot, MigrationPlan plan, bool dryRun)
+    {
+        var containers = plan == null || plan.Containers == null
+            ? new List<ContainerDefinition>()
+            : plan.Containers;
+
+        var requirements = new List<TargetSpaceRequirement>();
+        var stagingBytes = CalculateEstimatedMigrationBytes(containers);
+        if (stagingBytes > 0)
+        {
+            requirements.Add(new TargetSpaceRequirement
+            {
+                Path = "/tmp",
+                Description = "container staging archives",
+                RequiredBytes = stagingBytes
+            });
+        }
+
+        var bindBytes = containers
+            .Where(item => item != null)
+            .SelectMany(item => item.Mounts ?? new List<MountDefinition>())
+            .Where(item => item != null && string.Equals(item.Type, "bind", StringComparison.OrdinalIgnoreCase))
+            .Select(item => Math.Max(0L, item.EstimatedSizeBytes))
+            .Sum();
+        if (bindBytes > 0)
+        {
+            requirements.Add(new TargetSpaceRequirement
+            {
+                Path = targetRoot,
+                Description = "bind mount data under target path",
+                RequiredBytes = bindBytes
+            });
+        }
+
+        var dockerRootBytes = AddBytes(
+            CalculateEstimatedVolumeBytes(containers),
+            CalculateEstimatedMissingImageBytes(targetClient, targetInfo, containers));
+        if (dockerRootBytes > 0)
+        {
+            requirements.Add(new TargetSpaceRequirement
+            {
+                Path = GetDockerRootPath(targetClient, targetInfo),
+                Description = "Docker volumes and images",
+                RequiredBytes = dockerRootBytes
+            });
+        }
+
+        ValidateRemoteFilesystemRequirements(targetClient, targetInfo, requirements, dryRun, "container migration target");
+    }
+
+    private static void ValidateVirtualMachineTargetFreeSpace(SshClient targetClient, ConnectionInfoData targetInfo, VirtualMachineMigrationPlan plan, bool dryRun)
+    {
+        if (plan == null || plan.VirtualMachines == null || plan.VirtualMachines.Count == 0)
+        {
+            return;
+        }
+
+        var storagePath = ResolveProxmoxStorageFilesystemPath(targetClient, targetInfo, plan.TargetStorage);
+        var usesStorageStaging = !string.IsNullOrWhiteSpace(storagePath);
+        var requiredBytes = CalculateVirtualMachineTargetStorageBytes(plan, usesStorageStaging);
+        if (requiredBytes <= 0)
+        {
+            Log("Target free-space check: no VM disk data is estimated for migration.");
+            return;
+        }
+
+        var availableBytes = GetProxmoxStorageAvailableBytes(targetClient, targetInfo, plan.TargetStorage, dryRun);
+        if (availableBytes < 0)
+        {
+            return;
+        }
+
+        Log("Target free-space check: Proxmox storage {0} has {1}; required {2}{3}.",
+            plan.TargetStorage,
+            FormatBytes(availableBytes),
+            FormatBytes(requiredBytes),
+            usesStorageStaging ? " (staging copy plus imported VM disks)" : " (direct VM disk allocation)");
+
+        if (availableBytes >= requiredBytes)
+        {
+            return;
+        }
+
+        var message =
+            "Insufficient free space on Proxmox storage " + plan.TargetStorage + ". " +
+            "Available: " + FormatBytes(availableBytes) + "; required: " + FormatBytes(requiredBytes) + "; missing: " + FormatBytes(requiredBytes - availableBytes) + ".";
+        Log("[!] " + message);
+        if (!dryRun)
+        {
+            throw new InvalidOperationException(message);
         }
     }
 
@@ -6015,6 +6110,7 @@ internal static class MigratorCore
                     pathSizeCache[sourcePath] = sizeBytes;
                 }
 
+                mount.EstimatedSizeBytes = sizeBytes;
                 dataBytes += sizeBytes;
             }
 
@@ -6112,6 +6208,262 @@ internal static class MigratorCore
             .Sum();
 
         return imageBytes + dataBytes;
+    }
+
+    private static long CalculateEstimatedVolumeBytes(List<ContainerDefinition> definitions)
+    {
+        if (definitions == null || definitions.Count == 0)
+        {
+            return 0;
+        }
+
+        return definitions
+            .Where(item => item != null)
+            .SelectMany(item => item.Mounts ?? new List<MountDefinition>())
+            .Where(item => item != null && string.Equals(item.Type, "volume", StringComparison.OrdinalIgnoreCase))
+            .Select(item => Math.Max(0L, item.EstimatedSizeBytes))
+            .Sum();
+    }
+
+    private static long CalculateEstimatedMissingImageBytes(SshClient targetClient, ConnectionInfoData targetInfo, List<ContainerDefinition> definitions)
+    {
+        if (definitions == null || definitions.Count == 0)
+        {
+            return 0;
+        }
+
+        long total = 0;
+        foreach (var group in definitions
+            .Where(item => item != null && !string.IsNullOrWhiteSpace(item.Image))
+            .GroupBy(item => item.Image, StringComparer.OrdinalIgnoreCase))
+        {
+            if (ImageExistsOnTarget(targetClient, targetInfo, group.Key))
+            {
+                continue;
+            }
+
+            total = AddBytes(total, Math.Max(0L, group.First().EstimatedImageBytes));
+        }
+
+        return total;
+    }
+
+    private static long CalculateVirtualMachineTargetStorageBytes(VirtualMachineMigrationPlan plan, bool includeStorageStaging)
+    {
+        if (plan == null || plan.VirtualMachines == null)
+        {
+            return 0;
+        }
+
+        long total = 0;
+        foreach (var vm in plan.VirtualMachines)
+        {
+            foreach (var disk in vm.Disks ?? new List<VirtualMachineDiskDefinition>())
+            {
+                if (disk == null)
+                {
+                    continue;
+                }
+
+                var finalDiskBytes = RoundUpToGiB(Math.Max(disk.VirtualSizeBytes, disk.ActualSizeBytes));
+                var transferBytes = Math.Max(disk.ActualSizeBytes, disk.VirtualSizeBytes);
+                total = AddBytes(total, finalDiskBytes);
+                if (includeStorageStaging)
+                {
+                    total = AddBytes(total, transferBytes);
+                }
+            }
+        }
+
+        return total;
+    }
+
+    private static long RoundUpToGiB(long bytes)
+    {
+        if (bytes <= 0)
+        {
+            return 0;
+        }
+
+        const long gib = 1024L * 1024L * 1024L;
+        return ((bytes + gib - 1L) / gib) * gib;
+    }
+
+    private static long AddBytes(long left, long right)
+    {
+        if (right <= 0)
+        {
+            return left;
+        }
+
+        return long.MaxValue - left < right ? long.MaxValue : left + right;
+    }
+
+    private static void ValidateRemoteFilesystemRequirements(SshClient client, ConnectionInfoData connectionInfo, List<TargetSpaceRequirement> requirements, bool dryRun, string targetLabel)
+    {
+        var effectiveRequirements = (requirements ?? new List<TargetSpaceRequirement>())
+            .Where(item => item != null && item.RequiredBytes > 0)
+            .ToList();
+        if (effectiveRequirements.Count == 0)
+        {
+            Log("Target free-space check: no target disk usage is estimated for {0}.", targetLabel);
+            return;
+        }
+
+        var checks = new Dictionary<string, TargetSpaceCheck>(StringComparer.OrdinalIgnoreCase);
+        foreach (var requirement in effectiveRequirements)
+        {
+            RemoteFilesystemSpace space;
+            try
+            {
+                space = GetRemoteFilesystemSpaceForPath(client, connectionInfo, requirement.Path);
+            }
+            catch (Exception ex)
+            {
+                var message = "Unable to verify target free space for " + requirement.Description + " at " + requirement.Path + ": " + ex.Message;
+                Log("[!] " + message);
+                if (!dryRun)
+                {
+                    throw new InvalidOperationException(message, ex);
+                }
+
+                continue;
+            }
+
+            var key = NormalizeOptionalValue(space.MountPoint) ?? NormalizeOptionalValue(requirement.Path) ?? "/";
+            TargetSpaceCheck check;
+            if (!checks.TryGetValue(key, out check))
+            {
+                check = new TargetSpaceCheck
+                {
+                    MountPoint = key,
+                    AvailableBytes = space.AvailableBytes
+                };
+                checks[key] = check;
+            }
+
+            check.RequiredBytes = AddBytes(check.RequiredBytes, requirement.RequiredBytes);
+            check.Details.Add(requirement.Description + "=" + FormatBytes(requirement.RequiredBytes));
+        }
+
+        var insufficient = new List<TargetSpaceCheck>();
+        foreach (var check in checks.Values.OrderBy(item => item.MountPoint, StringComparer.OrdinalIgnoreCase))
+        {
+            Log("Target free-space check: filesystem {0} has {1}; required {2} ({3}).",
+                check.MountPoint,
+                FormatBytes(check.AvailableBytes),
+                FormatBytes(check.RequiredBytes),
+                string.Join(", ", check.Details));
+
+            if (check.AvailableBytes < check.RequiredBytes)
+            {
+                insufficient.Add(check);
+            }
+        }
+
+        if (insufficient.Count == 0)
+        {
+            return;
+        }
+
+        var messageBuilder = new StringBuilder();
+        messageBuilder.AppendLine("Insufficient free space on target for " + targetLabel + ".");
+        foreach (var check in insufficient)
+        {
+            messageBuilder.AppendLine(
+                "- " + check.MountPoint +
+                ": available " + FormatBytes(check.AvailableBytes) +
+                "; required " + FormatBytes(check.RequiredBytes) +
+                "; missing " + FormatBytes(check.RequiredBytes - check.AvailableBytes) +
+                " (" + string.Join(", ", check.Details) + ")");
+        }
+
+        var messageText = messageBuilder.ToString().Trim();
+        Log("[!] " + messageText.Replace(Environment.NewLine, " | "));
+        if (!dryRun)
+        {
+            throw new InvalidOperationException(messageText);
+        }
+    }
+
+    private static RemoteFilesystemSpace GetRemoteFilesystemSpaceForPath(SshClient client, ConnectionInfoData connectionInfo, string remotePath)
+    {
+        var path = NormalizeOptionalValue(remotePath) ?? "/";
+        var command =
+            "path=" + ShellQuote(path) + "; " +
+            "if [ -z \"$path\" ]; then path=/; fi; " +
+            "while [ ! -e \"$path\" ] && [ \"$path\" != \"/\" ]; do path=${path%/*}; if [ -z \"$path\" ]; then path=/; fi; done; " +
+            "df -PkP \"$path\" | awk 'NR==2 {printf \"%.0f\\t%s\", $4 * 1024, $6}'";
+        var output = ExecuteCommand(client, command, connectionInfo).Trim();
+        var parts = output.Split(new[] { '\t' }, 2);
+        if (parts.Length < 2)
+        {
+            throw new InvalidOperationException("Unexpected df output: " + output);
+        }
+
+        return new RemoteFilesystemSpace
+        {
+            AvailableBytes = ParseByteCount(parts[0]),
+            MountPoint = NormalizeOptionalValue(parts[1]) ?? path
+        };
+    }
+
+    private static long GetProxmoxStorageAvailableBytes(SshClient targetClient, ConnectionInfoData targetInfo, string targetStorage, bool dryRun)
+    {
+        var storage = NormalizeOptionalValue(targetStorage);
+        if (storage == null)
+        {
+            throw new InvalidOperationException("Proxmox target storage is required for free-space validation.");
+        }
+
+        try
+        {
+            var command =
+                "storage=" + ShellQuote(storage) + "; " +
+                "pvesm status | awk -v storage=\"$storage\" '$1 == storage {printf \"%s\", $6; found=1} END {if (!found) exit 1}'";
+            var output = ExecuteCommand(targetClient, command, targetInfo).Trim();
+            return ParseByteCount(output) * 1024L;
+        }
+        catch (Exception ex)
+        {
+            var message = "Unable to verify free space on Proxmox storage " + storage + ": " + ex.Message;
+            Log("[!] " + message);
+            if (!dryRun)
+            {
+                throw new InvalidOperationException(message, ex);
+            }
+
+            return -1;
+        }
+    }
+
+    private static string GetDockerRootPath(SshClient targetClient, ConnectionInfoData targetInfo)
+    {
+        var output = ExecuteCommand(targetClient, "docker info --format '{{.DockerRootDir}}'", targetInfo);
+        return NormalizeOptionalValue(output) ?? "/var/lib/docker";
+    }
+
+    private static long ParseByteCount(string value)
+    {
+        var normalized = NormalizeOptionalValue(value);
+        if (normalized == null)
+        {
+            return 0;
+        }
+
+        long longValue;
+        if (long.TryParse(normalized, NumberStyles.Integer, CultureInfo.InvariantCulture, out longValue))
+        {
+            return Math.Max(0L, longValue);
+        }
+
+        double doubleValue;
+        if (double.TryParse(normalized, NumberStyles.Float, CultureInfo.InvariantCulture, out doubleValue) && doubleValue > 0)
+        {
+            return doubleValue >= long.MaxValue ? long.MaxValue : (long)Math.Round(doubleValue);
+        }
+
+        throw new InvalidOperationException("Unable to parse byte count: " + value);
     }
 
     private static string FormatBytes(long bytes)
@@ -7056,6 +7408,32 @@ internal sealed class MigrationPlan
     public List<ComposeFileArtifact> ComposeFiles { get; set; }
 }
 
+internal sealed class TargetSpaceRequirement
+{
+    public string Path { get; set; }
+    public string Description { get; set; }
+    public long RequiredBytes { get; set; }
+}
+
+internal sealed class RemoteFilesystemSpace
+{
+    public string MountPoint { get; set; }
+    public long AvailableBytes { get; set; }
+}
+
+internal sealed class TargetSpaceCheck
+{
+    public TargetSpaceCheck()
+    {
+        Details = new List<string>();
+    }
+
+    public string MountPoint { get; set; }
+    public long AvailableBytes { get; set; }
+    public long RequiredBytes { get; set; }
+    public List<string> Details { get; set; }
+}
+
 internal sealed class ConnectionInfoData
 {
     public string Host { get; set; }
@@ -7200,6 +7578,7 @@ internal sealed class MountDefinition
     public string VolumeName { get; set; }
     public string ArchiveFileName { get; set; }
     public string SafeName { get; set; }
+    public long EstimatedSizeBytes { get; set; }
 }
 
 internal sealed class PortBindingItem
