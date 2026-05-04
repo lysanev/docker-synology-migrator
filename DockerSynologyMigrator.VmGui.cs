@@ -409,9 +409,10 @@ internal sealed class VmMigrationForm : Form
         layout.Margin = new Padding(0);
         layout.Padding = new Padding(0);
         layout.ColumnCount = 1;
-        layout.RowCount = 2;
+        layout.RowCount = 3;
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44F));
-        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 56F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 44F));
 
         var buttons = new FlowLayoutPanel();
         buttons.Dock = DockStyle.Fill;
@@ -453,16 +454,9 @@ internal sealed class VmMigrationForm : Form
         _targetDetailsTextBox.Font = new Font(FontFamily.GenericMonospace, 9F);
         _targetDetailsTextBox.Text = "Load Proxmox inventory to manage imported virtual machines.";
 
-        _targetVirtualMachineSplitContainer.Dock = DockStyle.Fill;
-        _targetVirtualMachineSplitContainer.Margin = new Padding(0);
-        _targetVirtualMachineSplitContainer.Orientation = Orientation.Horizontal;
-        _targetVirtualMachineSplitContainer.SplitterWidth = 6;
-        ConfigureInitialSplitterDistance(_targetVirtualMachineSplitContainer, 0, 150);
-        _targetVirtualMachineSplitContainer.Panel1.Controls.Add(_targetVirtualMachineListView);
-        _targetVirtualMachineSplitContainer.Panel2.Controls.Add(_targetDetailsTextBox);
-
         layout.Controls.Add(buttons, 0, 0);
-        layout.Controls.Add(_targetVirtualMachineSplitContainer, 0, 1);
+        layout.Controls.Add(_targetVirtualMachineListView, 0, 1);
+        layout.Controls.Add(_targetDetailsTextBox, 0, 2);
         return layout;
     }
 
@@ -704,7 +698,7 @@ internal sealed class VmMigrationForm : Form
             profile.VmWindowState = WindowState == FormWindowState.Maximized ? "Maximized" : "Normal";
             profile.VmWorkspaceSplitterDistance = CaptureSplitterDistance(_workspaceSplitContainer);
             profile.VmMainSplitterDistance = CaptureSplitterDistance(_mainSplitContainer);
-            profile.VmTargetSplitterDistance = CaptureSplitterDistance(_targetVirtualMachineSplitContainer);
+            profile.VmTargetSplitterDistance = null;
             profile.VmSourceVirtualMachineColumnWidths = CaptureColumnWidths(_sourceVirtualMachineListView);
             profile.VmTargetVirtualMachineColumnWidths = CaptureColumnWidths(_targetVirtualMachineListView);
 
@@ -767,7 +761,7 @@ internal sealed class VmMigrationForm : Form
             ApplyColumnWidths(_targetVirtualMachineListView, profile.VmTargetVirtualMachineColumnWidths);
             ApplySplitterDistance(_workspaceSplitContainer, profile.VmWorkspaceSplitterDistance);
             ApplySplitterDistance(_mainSplitContainer, profile.VmMainSplitterDistance);
-            ApplySplitterDistance(_targetVirtualMachineSplitContainer, profile.VmTargetSplitterDistance);
+            BeginInvoke((Action)AdjustTargetVirtualMachineColumnsToWidth);
         });
     }
 

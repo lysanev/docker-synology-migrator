@@ -274,8 +274,10 @@ internal static class MigratorCore
             using (var targetSftp = CreateSftp(options.Target))
             {
                 targetSftp.Connect();
-                var stagingRoot = CreateStagingRoot(targetClient, options.Target);
-                Log("VM target staging path: {0}", stagingRoot);
+                var stagingRoot = CreateVirtualMachineStagingRoot(targetClient, options.Target, plan.TargetStorage);
+                Log(string.IsNullOrWhiteSpace(stagingRoot)
+                    ? "VM target staging path: direct storage volume writes on " + plan.TargetStorage
+                    : "VM target staging path: " + stagingRoot);
                 PrepareTargetRoot(targetClient, options.TargetRoot, options.Target);
 
                 foreach (var vm in plan.VirtualMachines)
@@ -295,7 +297,7 @@ internal static class MigratorCore
                         vm.AssignedTargetVmId = vmId;
                         Log("Creating Proxmox VM {0} ({1})...", vm.Name, vmId);
                         CreateTargetVirtualMachineSkeleton(targetClient, options.Target, vm, vmId, options.TargetBridge);
-                        ImportVirtualMachineDisks(sourceClient, options.Source, targetClient, options.Target, targetSftp, options.TargetRoot, stagingRoot, vm, options.TargetStorage);
+                        ImportVirtualMachineDisks(sourceClient, options.Source, targetClient, options.Target, targetSftp, stagingRoot, vm, options.TargetStorage);
 
                         if (options.StartImportedVirtualMachines)
                         {
@@ -3035,6 +3037,7 @@ internal static class MigratorCore
         Log("Target root: {0}", options.TargetRoot);
         Log("Target storage: {0}", plan.TargetStorage);
         Log("Target bridge: {0}", plan.TargetBridge);
+        Log("VM temporary files will use the selected Proxmox storage when it exposes a filesystem path.");
         Log("Virtual machines in plan: {0}", plan.VirtualMachines.Count);
         Log("Estimated VM transfer size: {0}", FormatBytes(plan.VirtualMachines.Sum(item => item.EstimatedTransferBytes)));
         Log(options.StopVirtualMachinesDuringExport
@@ -3193,9 +3196,12 @@ internal static class MigratorCore
         ExecuteCommand(targetClient, string.Join(" ", parts), target);
     }
 
-    private static void ImportVirtualMachineDisks(SshClient sourceClient, ConnectionInfoData source, SshClient targetClient, ConnectionInfoData target, SftpClient targetSftp, string targetRoot, string stagingRoot, VirtualMachineDefinition vm, string targetStorage)
+    private static void ImportVirtualMachineDisks(SshClient sourceClient, ConnectionInfoData source, SshClient targetClient, ConnectionInfoData target, SftpClient targetSftp, string stagingRoot, VirtualMachineDefinition vm, string targetStorage)
     {
-        ExecuteCommand(targetClient, "mkdir -p " + ShellQuote(targetRoot.TrimEnd('/') + "/vm-import"), target);
+        if (!string.IsNullOrWhiteSpace(stagingRoot))
+        {
+            ExecuteCommand(targetClient, "mkdir -p " + ShellQuote(stagingRoot.TrimEnd('/') + "/vm-import"), target);
+        }
 
         for (var index = 0; index < vm.Disks.Count; index++)
         {
@@ -3217,36 +3223,106 @@ internal static class MigratorCore
             var localTempPath = DownloadCommandOutputToTempFile(sourceClient, source, "cat " + ShellQuote(disk.SourcePath), BuildVirtualMachineDiskFileName(vm, disk, index));
             try
             {
-                var remoteFileName = BuildVirtualMachineDiskFileName(vm, disk, index);
-                var remotePath = targetRoot.TrimEnd('/') + "/vm-import/" + remoteFileName;
-                Log("Uploading VM disk {0} to Proxmox staging...", disk.TargetName);
-                UploadLocalFile(targetSftp, localTempPath, remotePath);
-
-                var vmId = vm.AssignedTargetVmId ?? 0;
-                Log("Importing VM disk {0} into Proxmox storage {1}...", disk.TargetName, targetStorage);
-                ExecuteCommand(targetClient,
-                    "qm importdisk " + vmId.ToString(CultureInfo.InvariantCulture) + " " + ShellQuote(remotePath) + " " + ShellQuote(targetStorage),
-                    target);
-
-                var unusedReference = GetLatestUnusedDiskReference(targetClient, target, vmId);
-                ExecuteCommand(targetClient,
-                    "qm set " + vmId.ToString(CultureInfo.InvariantCulture) + " --scsi" + index.ToString(CultureInfo.InvariantCulture) + " " + ShellQuote(unusedReference),
-                    target);
-
-                if (index == 0)
+                if (!string.IsNullOrWhiteSpace(stagingRoot))
                 {
-                    ExecuteCommand(targetClient,
-                        "qm set " + vmId.ToString(CultureInfo.InvariantCulture) + " --boot order=scsi0",
-                        target);
+                    ImportVirtualMachineDiskFromStorageStaging(targetClient, target, targetSftp, localTempPath, stagingRoot, vm, disk, index, targetStorage);
                 }
-
-                ExecuteCommand(targetClient, "rm -f " + ShellQuote(remotePath), target);
+                else
+                {
+                    ImportRawVirtualMachineDiskDirectToStorage(targetClient, target, targetSftp, localTempPath, vm, disk, index, targetStorage);
+                }
             }
             finally
             {
                 DeleteLocalTempFile(localTempPath);
             }
         }
+    }
+
+    private static void ImportVirtualMachineDiskFromStorageStaging(SshClient targetClient, ConnectionInfoData target, SftpClient targetSftp, string localTempPath, string stagingRoot, VirtualMachineDefinition vm, VirtualMachineDiskDefinition disk, int index, string targetStorage)
+    {
+        var remoteFileName = BuildVirtualMachineDiskFileName(vm, disk, index);
+        var remotePath = stagingRoot.TrimEnd('/') + "/vm-import/" + remoteFileName;
+        Log("Uploading VM disk {0} to Proxmox staging on storage {1}...", disk.TargetName, targetStorage);
+        UploadLocalFile(targetSftp, localTempPath, remotePath);
+
+        var vmId = vm.AssignedTargetVmId ?? 0;
+        Log("Importing VM disk {0} into Proxmox storage {1}...", disk.TargetName, targetStorage);
+        ExecuteCommand(targetClient,
+            "qm importdisk " + vmId.ToString(CultureInfo.InvariantCulture) + " " + ShellQuote(remotePath) + " " + ShellQuote(targetStorage),
+            target);
+
+        var unusedReference = GetLatestUnusedDiskReference(targetClient, target, vmId);
+        ExecuteCommand(targetClient,
+            "qm set " + vmId.ToString(CultureInfo.InvariantCulture) + " --scsi" + index.ToString(CultureInfo.InvariantCulture) + " " + ShellQuote(unusedReference),
+            target);
+
+        SetVirtualMachineBootDiskIfNeeded(targetClient, target, vmId, index);
+        ExecuteCommand(targetClient, "rm -f " + ShellQuote(remotePath), target);
+    }
+
+    private static void ImportRawVirtualMachineDiskDirectToStorage(SshClient targetClient, ConnectionInfoData target, SftpClient targetSftp, string localTempPath, VirtualMachineDefinition vm, VirtualMachineDiskDefinition disk, int index, string targetStorage)
+    {
+        var diskFormat = NormalizeOptionalValue(disk.Format);
+        if (!string.IsNullOrWhiteSpace(diskFormat) && !string.Equals(diskFormat, "raw", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                "Selected Proxmox storage " + targetStorage + " does not expose a filesystem staging path, and VM disk " +
+                vm.Name + ":" + (disk.TargetName ?? ("disk" + index.ToString(CultureInfo.InvariantCulture))) +
+                " is " + diskFormat + ". Use a file-based Proxmox storage for temporary VM imports or convert the source disk to raw.");
+        }
+
+        var vmId = vm.AssignedTargetVmId ?? 0;
+        var diskSizeBytes = Math.Max(Math.Max(disk.VirtualSizeBytes, disk.ActualSizeBytes), new FileInfo(localTempPath).Length);
+        var diskSizeGiB = Math.Max(1L, (long)Math.Ceiling(diskSizeBytes / 1073741824D));
+        var scsiKey = "scsi" + index.ToString(CultureInfo.InvariantCulture);
+
+        Log("Allocating VM disk {0} directly on Proxmox storage {1}...", disk.TargetName, targetStorage);
+        ExecuteCommand(targetClient,
+            "qm set " + vmId.ToString(CultureInfo.InvariantCulture) + " --" + scsiKey + " " + ShellQuote(targetStorage + ":" + diskSizeGiB.ToString(CultureInfo.InvariantCulture)),
+            target);
+
+        var diskReference = GetConfiguredDiskReference(targetClient, target, vmId, scsiKey);
+        var diskPath = ExecuteCommand(targetClient, "pvesm path " + ShellQuote(diskReference), target).Trim();
+        if (string.IsNullOrWhiteSpace(diskPath))
+        {
+            throw new InvalidOperationException("Unable to resolve Proxmox volume path for " + diskReference + ".");
+        }
+
+        if (!diskPath.StartsWith("/", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                "Selected Proxmox storage " + targetStorage + " does not expose a writable local volume path for " + diskReference +
+                ". Use a file-based Proxmox storage for VM staging/import, or select a local block storage whose 'pvesm path' returns /dev/...");
+        }
+
+        Log("Uploading raw VM disk {0} directly to Proxmox volume {1}...", disk.TargetName, diskReference);
+        UploadLocalFile(targetSftp, localTempPath, diskPath);
+        SetVirtualMachineBootDiskIfNeeded(targetClient, target, vmId, index);
+    }
+
+    private static void SetVirtualMachineBootDiskIfNeeded(SshClient targetClient, ConnectionInfoData target, int vmId, int index)
+    {
+        if (index != 0)
+        {
+            return;
+        }
+
+        ExecuteCommand(targetClient,
+            "qm set " + vmId.ToString(CultureInfo.InvariantCulture) + " --boot order=scsi0",
+            target);
+    }
+
+    private static string GetConfiguredDiskReference(SshClient targetClient, ConnectionInfoData target, int vmId, string diskKey)
+    {
+        var config = ExecuteCommand(targetClient, "qm config " + vmId.ToString(CultureInfo.InvariantCulture), target);
+        var match = Regex.Match(config ?? string.Empty, "^" + Regex.Escape(diskKey) + ":\\s*([^,\\r\\n]+)", RegexOptions.IgnoreCase | RegexOptions.Multiline);
+        if (!match.Success)
+        {
+            throw new InvalidOperationException("Proxmox did not create " + diskKey + " for VM " + vmId.ToString(CultureInfo.InvariantCulture) + ".");
+        }
+
+        return match.Groups[1].Value.Trim();
     }
 
     private static string GetLatestUnusedDiskReference(SshClient targetClient, ConnectionInfoData target, int vmId)
@@ -6277,6 +6353,47 @@ internal static class MigratorCore
     {
         var output = ExecuteCommand(targetClient, "stage=$(mktemp -d /tmp/docker-synology-migrator.XXXXXX) && mkdir -p \"$stage/archives\" \"$stage/" + ManagedComposeDirectoryName + "\" && printf '%s' \"$stage\"", targetInfo);
         return output.Trim();
+    }
+
+    private static string CreateVirtualMachineStagingRoot(SshClient targetClient, ConnectionInfoData targetInfo, string targetStorage)
+    {
+        var storagePath = ResolveProxmoxStorageFilesystemPath(targetClient, targetInfo, targetStorage);
+        if (string.IsNullOrWhiteSpace(storagePath))
+        {
+            Log("Proxmox storage {0} has no filesystem path; raw VM disks will be written directly to allocated storage volumes.", targetStorage);
+            return null;
+        }
+
+        var command =
+            "root=" + ShellQuote(storagePath.TrimEnd('/')) + "; " +
+            "stage=$(mktemp -d \"$root/docker-synology-migrator.XXXXXX\") && " +
+            "mkdir -p \"$stage/vm-import\" && printf '%s' \"$stage\"";
+        return ExecuteCommand(targetClient, command, targetInfo).Trim();
+    }
+
+    private static string ResolveProxmoxStorageFilesystemPath(SshClient targetClient, ConnectionInfoData targetInfo, string targetStorage)
+    {
+        var storage = NormalizeOptionalValue(targetStorage);
+        if (storage == null)
+        {
+            return null;
+        }
+
+        var command = "pvesm config " + ShellQuote(storage) + " 2>/dev/null | awk '$1 == \"path\" { print $2; exit }'";
+        string output;
+        string error;
+        if (!TryExecuteCommand(targetClient, command, targetInfo, out output, out error))
+        {
+            return null;
+        }
+
+        var path = NormalizeOptionalValue((output ?? string.Empty).Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).FirstOrDefault());
+        if (path == null)
+        {
+            return null;
+        }
+
+        return RemotePathIsDirectory(targetClient, targetInfo, path) ? path : null;
     }
 
     private static void MigrateLegacyComposeIfNeeded(SshClient targetClient, string targetRoot, ConnectionInfoData targetInfo)
