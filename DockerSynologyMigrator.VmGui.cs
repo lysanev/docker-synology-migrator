@@ -114,7 +114,7 @@ internal sealed class VmMigrationForm : Form
         root.RowCount = 4;
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 76F));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 304F));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 68F));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 82F));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
         Controls.Add(root);
 
@@ -285,8 +285,8 @@ internal sealed class VmMigrationForm : Form
         panel.Dock = DockStyle.Fill;
         panel.ColumnCount = 1;
         panel.RowCount = 2;
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
-        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 28F));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 38F));
+        panel.RowStyles.Add(new RowStyle(SizeType.Absolute, 36F));
 
         var buttonsPanel = new FlowLayoutPanel();
         buttonsPanel.Dock = DockStyle.Fill;
@@ -319,15 +319,17 @@ internal sealed class VmMigrationForm : Form
         statusPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
 
         _selectionLabel.Dock = DockStyle.Fill;
+        _selectionLabel.Margin = new Padding(3, 2, 3, 2);
         _selectionLabel.TextAlign = ContentAlignment.MiddleLeft;
         _selectionLabel.AutoEllipsis = true;
 
         _statusLabel.Dock = DockStyle.Fill;
+        _statusLabel.Margin = new Padding(3, 2, 3, 2);
         _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
         _statusLabel.AutoEllipsis = true;
 
         _progressBar.Dock = DockStyle.Fill;
-        _progressBar.Margin = new Padding(8, 8, 8, 8);
+        _progressBar.Margin = new Padding(8, 6, 8, 6);
         _progressBar.Minimum = 0;
         _progressBar.Maximum = 1000;
         _progressBar.Value = 0;
